@@ -63,8 +63,14 @@ def classic_handler(email_settings):
     return ClassicEmailHandler(email_settings)
 
 
-def _make_mock_imap(**overrides):
-    """Helper to build an AsyncMock IMAP client with sensible defaults."""
+def _make_mock_imap(*, existing_uids: list[str] | None = None, **overrides):
+    """Helper to build an AsyncMock IMAP client with sensible defaults.
+
+    Args:
+        existing_uids: List of UIDs that should be reported as existing.
+                       If None, all UIDs are reported as existing by default.
+        **overrides: Additional mock attributes to set.
+    """
     capabilities = overrides.pop("capabilities", ("IMAP4rev1", "UIDPLUS"))
     mock = AsyncMock()
     mock._client_task = asyncio.Future()
@@ -72,12 +78,24 @@ def _make_mock_imap(**overrides):
     mock.wait_hello_from_server = AsyncMock()
     mock.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
     mock.select = AsyncMock(return_value=("OK", []))
-    mock.uid = AsyncMock(return_value=("OK", []))
     mock.expunge = AsyncMock(return_value=("OK", []))
     mock.logout = AsyncMock()
     mock.list = AsyncMock(return_value=("OK", []))
     mock.protocol = MagicMock(capabilities=capabilities)
     mock.protocol.capability = AsyncMock()
+
+    # Build a UID handler that returns existence info for fetch and default OK for others
+    async def uid_handler(command: str, *args):
+        if command == "fetch" and len(args) >= 2 and args[1] == "(FLAGS)":
+            uid_list = args[0].split(",")
+            data = []
+            for uid in uid_list:
+                if existing_uids is None or uid in existing_uids:
+                    data.append(f"* {uid} FETCH (UID {uid} FLAGS (\\Seen))".encode())
+            return ("OK", data)
+        return ("OK", [])
+
+    mock.uid = AsyncMock(side_effect=uid_handler)
     for k, v in overrides.items():
         setattr(mock, k, v)
     return mock
@@ -90,20 +108,21 @@ def _make_mock_imap(**overrides):
 
 @pytest.mark.asyncio
 async def test_move_without_uidplus_rejects_fallback_before_copy(email_client):
-    mock_imap = _make_mock_imap(capabilities=("IMAP4rev1",))
+    mock_imap = _make_mock_imap(capabilities=("IMAP4rev1",), existing_uids=["100"])
 
     with patch.object(email_client, "imap_class", return_value=mock_imap):
         moved_ids, failed_ids = await email_client.move_emails(["100"], "INBOX", "Archive")
 
     assert moved_ids == []
     assert failed_ids == ["100"]
-    mock_imap.uid.assert_not_called()
+    # UID existence check is called, but no move/copy should happen
+    assert mock_imap.uid.call_args_list[0].args[0] == "fetch"
     mock_imap.expunge.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_move_uses_post_auth_capabilities_and_rejects_fallback_before_copy(email_client):
-    mock_imap = _make_mock_imap(capabilities=("IMAP4rev1", "MOVE", "UIDPLUS"))
+    mock_imap = _make_mock_imap(capabilities=("IMAP4rev1", "MOVE", "UIDPLUS"), existing_uids=["100"])
 
     async def refresh_capabilities():
         mock_imap.protocol.capabilities = ("IMAP4rev1",)
@@ -113,33 +132,53 @@ async def test_move_uses_post_auth_capabilities_and_rejects_fallback_before_copy
         result = await email_client.move_emails(["100"], "INBOX", "Archive")
 
     assert result == ([], ["100"])
-    mock_imap.uid.assert_not_called()
+    # UID existence check is called, but no move/copy should happen after cap refresh
+    assert mock_imap.uid.call_args_list[0].args[0] == "fetch"
 
 
 @pytest.mark.asyncio
 async def test_move_normalizes_post_auth_move_for_check_and_command(email_client):
-    mock_imap = _make_mock_imap(capabilities=("IMAP4rev1",))
+    mock_imap = _make_mock_imap(capabilities=("IMAP4rev1",), existing_uids=["100"])
 
     async def refresh_capabilities():
         mock_imap.protocol.capabilities = ("imap4rev1", "move")
 
+    # Override uid to handle both fetch and move
+    async def uid_handler(command: str, *args):
+        if command == "fetch":
+            return ("OK", [b"* 100 FETCH (UID 100 FLAGS (\\Seen))"])
+        return ("OK", [])
+
+    mock_imap.uid = AsyncMock(side_effect=uid_handler)
     mock_imap.protocol.capability = AsyncMock(side_effect=refresh_capabilities)
     with patch.object(email_client, "imap_class", return_value=mock_imap):
         result = await email_client.move_emails(["100"], "INBOX", "Archive")
 
     assert result == (["100"], [])
     assert mock_imap.protocol.capabilities == {"IMAP4REV1", "MOVE"}
-    mock_imap.uid.assert_awaited_once_with("move", "100", '"Archive"')
+    # First call is fetch for UID existence, second is move
+    assert mock_imap.uid.call_args_list[0].args == ("fetch", "100", "(FLAGS)")
+    assert mock_imap.uid.call_args_list[1].args == ("move", "100", '"Archive"')
 
 
 @pytest.mark.asyncio
 async def test_move_duplicate_uids_have_one_provider_effect_and_consistent_results(email_client):
-    mock_imap = _make_mock_imap(capabilities=("IMAP4rev1", "MOVE"))
+    mock_imap = _make_mock_imap(capabilities=("IMAP4rev1", "MOVE"), existing_uids=["100"])
+
+    # Override uid to handle both fetch and move
+    async def uid_handler(command: str, *args):
+        if command == "fetch":
+            return ("OK", [b"* 100 FETCH (UID 100 FLAGS (\\Seen))"])
+        return ("OK", [])
+
+    mock_imap.uid = AsyncMock(side_effect=uid_handler)
     with patch.object(email_client, "imap_class", return_value=mock_imap):
         result = await email_client.move_emails(["100", "100"], "INBOX", "Archive")
 
     assert result == (["100", "100"], [])
-    mock_imap.uid.assert_awaited_once_with("move", "100", '"Archive"')
+    # First call is fetch for UID existence, second is move
+    assert mock_imap.uid.call_args_list[0].args[0] == "fetch"
+    assert mock_imap.uid.call_args_list[1].args == ("move", "100", '"Archive"')
 
 
 class TestEmailClientMoveEmails:
@@ -148,8 +187,16 @@ class TestEmailClientMoveEmails:
     @pytest.mark.asyncio
     async def test_move_emails_encodes_unicode_mailboxes(self, email_client):
         """Unicode mailbox names should be encoded before IMAP SELECT and COPY."""
-        mock_imap = _make_mock_imap()
+        mock_imap = _make_mock_imap(existing_uids=["100"])
         del mock_imap.move
+
+        # Override uid to handle both fetch and copy/store/expunge
+        async def uid_handler(command: str, *args):
+            if command == "fetch":
+                return ("OK", [b"* 100 FETCH (UID 100 FLAGS (\\Seen))"])
+            return ("OK", [])
+
+        mock_imap.uid = AsyncMock(side_effect=uid_handler)
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["100"], "Entwürfe", "Gelöschte Elemente")
@@ -157,14 +204,24 @@ class TestEmailClientMoveEmails:
         assert moved_ids == ["100"]
         assert failed_ids == []
         mock_imap.select.assert_called_once_with('"Entw&APw-rfe"')
-        assert mock_imap.uid.call_args_list[0].args == ("copy", "100", '"Gel&APY-schte Elemente"')
+        # First call is fetch for UID existence, then copy
+        assert mock_imap.uid.call_args_list[0].args == ("fetch", "100", "(FLAGS)")
+        assert mock_imap.uid.call_args_list[1].args == ("copy", "100", '"Gel&APY-schte Elemente"')
 
     @pytest.mark.asyncio
     async def test_move_emails_copy_delete_fallback(self, email_client):
         """When MOVE capability is absent, should use COPY + STORE \\Deleted + EXPUNGE."""
-        mock_imap = _make_mock_imap()
+        mock_imap = _make_mock_imap(existing_uids=["100", "200"])
         # No MOVE capability
         del mock_imap.move  # ensure hasattr(imap, "move") is False
+
+        # Override uid to handle both fetch and copy/store/expunge
+        async def uid_handler(command: str, *args):
+            if command == "fetch":
+                return ("OK", [b"* 100 FETCH (UID 100 FLAGS (\\Seen))", b"* 200 FETCH (UID 200 FLAGS (\\Seen))"])
+            return ("OK", [])
+
+        mock_imap.uid = AsyncMock(side_effect=uid_handler)
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["100", "200"], "INBOX", "Archive")
@@ -176,22 +233,31 @@ class TestEmailClientMoveEmails:
         mock_imap.login.assert_called_once()
         mock_imap.select.assert_called_once_with('"INBOX"')
 
-        # Verify COPY + STORE for each email, followed by target-scoped UID EXPUNGE.
-        assert mock_imap.uid.call_count == 5
+        # Verify fetch (UID check) + COPY + STORE for each email, followed by target-scoped UID EXPUNGE.
+        assert mock_imap.uid.call_count == 6  # 1 fetch + 2*copy + 2*store + 1 expunge
         calls = mock_imap.uid.call_args_list
-        assert calls[0].args == ("copy", "100", '"Archive"')
-        assert calls[1].args == ("store", "100", "+FLAGS", r"(\Deleted)")
-        assert calls[2].args == ("copy", "200", '"Archive"')
-        assert calls[3].args == ("store", "200", "+FLAGS", r"(\Deleted)")
-        assert calls[4].args == ("expunge", "100,200")
+        assert calls[0].args == ("fetch", "100,200", "(FLAGS)")
+        assert calls[1].args == ("copy", "100", '"Archive"')
+        assert calls[2].args == ("store", "100", "+FLAGS", r"(\Deleted)")
+        assert calls[3].args == ("copy", "200", '"Archive"')
+        assert calls[4].args == ("store", "200", "+FLAGS", r"(\Deleted)")
+        assert calls[5].args == ("expunge", "100,200")
         mock_imap.expunge.assert_not_called()
         mock_imap.logout.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_move_emails_with_move_capability(self, email_client):
         """When MOVE capability is present, should use UID MOVE directly."""
-        mock_imap = _make_mock_imap(capabilities=("IMAP4rev1", "MOVE", "IDLE"))
+        mock_imap = _make_mock_imap(capabilities=("IMAP4rev1", "MOVE", "IDLE"), existing_uids=["100"])
         mock_imap.move = AsyncMock()  # retained compatibility test double
+
+        # Override uid to handle both fetch and move
+        async def uid_handler(command: str, *args):
+            if command == "fetch":
+                return ("OK", [b"* 100 FETCH (UID 100 FLAGS (\\Seen))"])
+            return ("OK", [])
+
+        mock_imap.uid = AsyncMock(side_effect=uid_handler)
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["100"], "INBOX", "Trash")
@@ -199,19 +265,21 @@ class TestEmailClientMoveEmails:
         assert moved_ids == ["100"]
         assert failed_ids == []
 
-        # Should use uid("move", ...) instead of copy+store
-        mock_imap.uid.assert_called_once_with("move", "100", '"Trash"')
+        # Should use uid("fetch", ...) first, then uid("move", ...)
+        assert mock_imap.uid.call_args_list[0].args == ("fetch", "100", "(FLAGS)")
+        assert mock_imap.uid.call_args_list[1].args == ("move", "100", '"Trash"')
         # EXPUNGE should NOT be called when using MOVE
         mock_imap.expunge.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_move_emails_with_failures(self, email_client):
         """Emails that fail to move should be collected in failed_ids."""
-        mock_imap = _make_mock_imap()
+        mock_imap = _make_mock_imap(existing_uids=["100", "200"])
         del mock_imap.move  # no MOVE capability
 
-        # First email succeeds (copy OK, store OK), second email fails on copy
+        # First call is fetch for UID check, then email-specific operations
         side_effects = [
+            Response("OK", [b"* 100 FETCH (UID 100 FLAGS (\\Seen))", b"* 200 FETCH (UID 200 FLAGS (\\Seen))"]),  # fetch
             Response("OK", [b"copied"]),  # copy "100" succeeds
             Response("OK", [b"stored"]),  # store "100" succeeds
             Exception("IMAP error"),  # copy "200" fails
@@ -230,10 +298,15 @@ class TestEmailClientMoveEmails:
     @pytest.mark.asyncio
     async def test_move_emails_all_fail_no_expunge(self, email_client):
         """When all emails fail, EXPUNGE should not be called (no moved_ids)."""
-        mock_imap = _make_mock_imap()
+        mock_imap = _make_mock_imap(existing_uids=["100"])
         del mock_imap.move
 
-        mock_imap.uid = AsyncMock(side_effect=Exception("IMAP error"))
+        # fetch succeeds then copy fails
+        side_effects = [
+            Response("OK", [b"* 100 FETCH (UID 100 FLAGS (\\Seen))"]),  # fetch
+            Exception("IMAP error"),  # copy fails
+        ]
+        mock_imap.uid = AsyncMock(side_effect=side_effects)
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["100"], "INBOX", "Archive")
@@ -245,9 +318,17 @@ class TestEmailClientMoveEmails:
     @pytest.mark.asyncio
     async def test_move_emails_logout_error_handled(self, email_client):
         """Logout errors in the finally block should not propagate."""
-        mock_imap = _make_mock_imap()
+        mock_imap = _make_mock_imap(existing_uids=["100"])
         del mock_imap.move
         mock_imap.logout = AsyncMock(side_effect=Exception("Logout failed"))
+
+        # Override uid to handle both fetch and copy/store/expunge
+        async def uid_handler(command: str, *args):
+            if command == "fetch":
+                return ("OK", [b"* 100 FETCH (UID 100 FLAGS (\\Seen))"])
+            return ("OK", [])
+
+        mock_imap.uid = AsyncMock(side_effect=uid_handler)
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["100"], "INBOX", "Archive")
@@ -272,8 +353,14 @@ class TestEmailClientMoveEmails:
     @pytest.mark.asyncio
     async def test_move_emails_move_capability_with_failure(self, email_client):
         """Test failure when using native MOVE command."""
-        mock_imap = _make_mock_imap(capabilities=("IMAP4rev1", "MOVE"))
-        mock_imap.uid = AsyncMock(side_effect=Exception("MOVE failed"))
+        mock_imap = _make_mock_imap(capabilities=("IMAP4rev1", "MOVE"), existing_uids=["100"])
+
+        # fetch succeeds, move fails
+        side_effects = [
+            Response("OK", [b"* 100 FETCH (UID 100 FLAGS (\\Seen))"]),  # fetch
+            Exception("MOVE failed"),  # move fails
+        ]
+        mock_imap.uid = AsyncMock(side_effect=side_effects)
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["100"], "INBOX", "Trash")
@@ -284,27 +371,36 @@ class TestEmailClientMoveEmails:
     @pytest.mark.asyncio
     async def test_move_emails_copy_no_response_does_not_delete_source(self, email_client):
         """A COPY NO response should fail the email before STORE \\Deleted is sent."""
-        mock_imap = _make_mock_imap()
+        mock_imap = _make_mock_imap(existing_uids=["100"])
         del mock_imap.move
-        mock_imap.uid = AsyncMock(return_value=Response("NO", [b"[TRYCREATE] mailbox does not exist"]))
+
+        # fetch succeeds, copy fails with NO
+        side_effects = [
+            Response("OK", [b"* 100 FETCH (UID 100 FLAGS (\\Seen))"]),  # fetch
+            Response("NO", [b"[TRYCREATE] mailbox does not exist"]),  # copy fails
+        ]
+        mock_imap.uid = AsyncMock(side_effect=side_effects)
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["100"], "INBOX", "Missing")
 
         assert moved_ids == []
         assert failed_ids == ["100"]
-        mock_imap.uid.assert_called_once_with("copy", "100", '"Missing"')
+        # First call is fetch, second is copy
+        assert mock_imap.uid.call_args_list[0].args == ("fetch", "100", "(FLAGS)")
+        assert mock_imap.uid.call_args_list[1].args == ("copy", "100", '"Missing"')
         mock_imap.expunge.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_move_emails_store_no_response_marks_failed(self, email_client):
         """A STORE NO response should fail the email and skip EXPUNGE."""
-        mock_imap = _make_mock_imap()
+        mock_imap = _make_mock_imap(existing_uids=["100"])
         del mock_imap.move
         mock_imap.uid = AsyncMock(
             side_effect=[
-                Response("OK", [b"copied"]),
-                Response("NO", [b"store failed"]),
+                Response("OK", [b"* 100 FETCH (UID 100 FLAGS (\\Seen))"]),  # fetch
+                Response("OK", [b"copied"]),  # copy succeeds
+                Response("NO", [b"store failed"]),  # store fails
             ]
         )
 
@@ -313,14 +409,19 @@ class TestEmailClientMoveEmails:
 
         assert moved_ids == []
         assert failed_ids == ["100"]
-        assert mock_imap.uid.call_count == 2
+        assert mock_imap.uid.call_count == 3  # fetch + copy + store
         mock_imap.expunge.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_move_emails_move_no_response_marks_failed(self, email_client):
         """A native MOVE NO response should be reported as a failed move."""
-        mock_imap = _make_mock_imap(capabilities=("IMAP4rev1", "MOVE"))
-        mock_imap.uid = AsyncMock(return_value=Response("NO", [b"move failed"]))
+        mock_imap = _make_mock_imap(capabilities=("IMAP4rev1", "MOVE"), existing_uids=["100"])
+        mock_imap.uid = AsyncMock(
+            side_effect=[
+                Response("OK", [b"* 100 FETCH (UID 100 FLAGS (\\Seen))"]),  # fetch
+                Response("NO", [b"move failed"]),  # move fails
+            ]
+        )
 
         with patch.object(email_client, "imap_class", return_value=mock_imap):
             moved_ids, failed_ids = await email_client.move_emails(["100"], "INBOX", "Trash")
@@ -346,13 +447,14 @@ class TestEmailClientMoveEmails:
     @pytest.mark.asyncio
     async def test_move_emails_expunge_no_response_marks_moved_ids_failed(self, email_client):
         """An EXPUNGE NO response should report copied and flagged emails as failed."""
-        mock_imap = _make_mock_imap()
+        mock_imap = _make_mock_imap(existing_uids=["100"])
         del mock_imap.move
         mock_imap.uid = AsyncMock(
             side_effect=[
-                Response("OK", [b"copied"]),
-                Response("OK", [b"stored"]),
-                Response("NO", [b"expunge failed"]),
+                Response("OK", [b"* 100 FETCH (UID 100 FLAGS (\\Seen))"]),  # fetch
+                Response("OK", [b"copied"]),  # copy succeeds
+                Response("OK", [b"stored"]),  # store succeeds
+                Response("NO", [b"expunge failed"]),  # expunge fails
             ]
         )
 
@@ -363,6 +465,45 @@ class TestEmailClientMoveEmails:
         assert failed_ids == ["100"]
         assert mock_imap.uid.call_args_list[-1].args == ("expunge", "100")
         mock_imap.expunge.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_move_emails_nonexistent_uid_reported_as_failed(self, email_client):
+        """UIDs that don't exist in the source mailbox should be reported as failed."""
+        mock_imap = _make_mock_imap(capabilities=("IMAP4rev1", "MOVE"), existing_uids=[])
+        # fetch returns no UIDs (none exist)
+        mock_imap.uid = AsyncMock(return_value=Response("OK", []))
+
+        with patch.object(email_client, "imap_class", return_value=mock_imap):
+            moved_ids, failed_ids = await email_client.move_emails(["4294967295"], "INBOX", "Archive")
+
+        assert moved_ids == []
+        assert failed_ids == ["4294967295"]
+        # Only fetch was called, no move attempted
+        mock_imap.uid.assert_awaited_once_with("fetch", "4294967295", "(FLAGS)")
+        mock_imap.expunge.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_move_emails_partial_existence_reports_both(self, email_client):
+        """Mix of existing and nonexistent UIDs should be handled correctly."""
+        mock_imap = _make_mock_imap(capabilities=("IMAP4rev1", "MOVE"), existing_uids=["100"])
+
+        # Override uid to handle both fetch and move
+        async def uid_handler(command: str, *args):
+            if command == "fetch":
+                # Only UID 100 exists, not 200
+                return ("OK", [b"* 100 FETCH (UID 100 FLAGS (\\Seen))"])
+            return ("OK", [])
+
+        mock_imap.uid = AsyncMock(side_effect=uid_handler)
+
+        with patch.object(email_client, "imap_class", return_value=mock_imap):
+            moved_ids, failed_ids = await email_client.move_emails(["100", "200"], "INBOX", "Archive")
+
+        assert moved_ids == ["100"]
+        assert failed_ids == ["200"]  # 200 doesn't exist
+        # fetch + move for 100
+        assert mock_imap.uid.call_args_list[0].args == ("fetch", "100,200", "(FLAGS)")
+        assert mock_imap.uid.call_args_list[1].args == ("move", "100", '"Archive"')
 
 
 # ===========================================================================

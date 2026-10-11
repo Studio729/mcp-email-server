@@ -248,13 +248,13 @@ async def test_per_uid_fresh_guard_preserves_first_success(email_server):
 @pytest.mark.asyncio
 async def test_move_revocation_after_copy_is_unknown_no_delete_or_expunge(email_server):
     client = EmailClient(email_server)
-    imap = _imap()
+    imap = _imap(existing_uids=["1"])
     client.mutation_guard = MagicMock(side_effect=[None, PermissionError("revoked")])
     with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
         result = await client.move_emails_with_outcome(["1"], "INBOX", "Other", allowed_senders=[])
     assert result.outcomes[0].status == "unknown"
     assert result.reconciliation_needed
-    assert [call.args[0] for call in imap.uid.await_args_list] == ["copy"]
+    assert [call.args[0] for call in imap.uid.await_args_list] == ["fetch", "copy"]
 
 
 def test_managed_roundtrip_nullable_override_reset(tmp_path: Path, email_server):
@@ -443,12 +443,12 @@ async def test_sent_copy_revalidates_recipients_without_append_grant(email_setti
 async def test_move_expunge_revocation_preserves_copy_store_evidence(email_server):
     client = EmailClient(email_server)
     client.mutation_guard = MagicMock(side_effect=[None, None, PermissionError("revoked")])
-    imap = _imap()
+    imap = _imap(existing_uids=["1"])
     with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
         result = await client.move_emails_with_outcome(["1"], "INBOX", "Other", allowed_senders=[])
     assert result.outcomes[0].status == "unknown"
     assert result.reconciliation_needed
-    assert [call.args[0] for call in imap.uid.await_args_list] == ["copy", "store"]
+    assert [call.args[0] for call in imap.uid.await_args_list] == ["fetch", "copy", "store"]
     imap.expunge.assert_not_awaited()
 
 

@@ -563,7 +563,119 @@ class TestClassicEmailHandler:
 
             # Verify the client method was called correctly
             mock_get_body.assert_called_once_with(
-                "123", "INBOX", False, allowed_senders=[], body_offset=0, max_body_length=20000
+                "123", "INBOX", False, allowed_senders=[], body_offset=0, max_body_length=20000, include_headers=None
+            )
+
+    @pytest.mark.asyncio
+    async def test_get_emails_content_includes_raw_headers_phishing(self, classic_handler):
+        """Test that get_emails_content returns raw headers when include_headers='phishing'."""
+        now = datetime.now(UTC)
+        email_data = {
+            "email_id": "123",
+            "message_id": "<test@example.com>",
+            "subject": "Test Subject",
+            "from": "sender@example.com",
+            "to": ["recipient@example.com"],
+            "date": now,
+            "body": "Test body",
+            "attachments": [],
+            "headers": {
+                "Authentication-Results": ["mx.example.com; dkim=pass"],
+                "DKIM-Signature": ["v=1; a=rsa-sha256; d=example.com"],
+                "Received": ["from mail.example.com (192.0.2.1)", "from localhost (127.0.0.1)"],
+            },
+        }
+
+        mock_get_body = AsyncMock(return_value=email_data)
+
+        with patch.object(classic_handler.incoming_client, "get_email_body_by_id", mock_get_body):
+            result = await classic_handler.get_emails_content(
+                email_ids=["123"],
+                mailbox="INBOX",
+                include_headers="phishing",
+            )
+
+            assert len(result.emails) == 1
+            assert result.emails[0].headers == {
+                "Authentication-Results": ["mx.example.com; dkim=pass"],
+                "DKIM-Signature": ["v=1; a=rsa-sha256; d=example.com"],
+                "Received": ["from mail.example.com (192.0.2.1)", "from localhost (127.0.0.1)"],
+            }
+            mock_get_body.assert_called_once_with(
+                "123",
+                "INBOX",
+                False,
+                allowed_senders=[],
+                body_offset=0,
+                max_body_length=20000,
+                include_headers="phishing",
+            )
+
+    @pytest.mark.asyncio
+    async def test_get_emails_content_includes_raw_headers_custom_list(self, classic_handler):
+        """Test that get_emails_content returns only requested headers."""
+        now = datetime.now(UTC)
+        email_data = {
+            "email_id": "123",
+            "message_id": "<test@example.com>",
+            "subject": "Test Subject",
+            "from": "sender@example.com",
+            "to": ["recipient@example.com"],
+            "date": now,
+            "body": "Test body",
+            "attachments": [],
+            "headers": {
+                "List-Unsubscribe": ["<mailto:unsubscribe@example.com>"],
+            },
+        }
+
+        mock_get_body = AsyncMock(return_value=email_data)
+
+        with patch.object(classic_handler.incoming_client, "get_email_body_by_id", mock_get_body):
+            result = await classic_handler.get_emails_content(
+                email_ids=["123"],
+                include_headers=("List-Unsubscribe", "List-Unsubscribe-Post"),
+            )
+
+            assert result.emails[0].headers == {
+                "List-Unsubscribe": ["<mailto:unsubscribe@example.com>"],
+            }
+            mock_get_body.assert_called_once_with(
+                "123",
+                "INBOX",
+                False,
+                allowed_senders=[],
+                body_offset=0,
+                max_body_length=20000,
+                include_headers=("List-Unsubscribe", "List-Unsubscribe-Post"),
+            )
+
+    @pytest.mark.asyncio
+    async def test_get_emails_content_default_no_headers(self, classic_handler):
+        """Test that get_emails_content returns no headers by default (backward compatible)."""
+        now = datetime.now(UTC)
+        email_data = {
+            "email_id": "123",
+            "message_id": "<test@example.com>",
+            "subject": "Test Subject",
+            "from": "sender@example.com",
+            "to": ["recipient@example.com"],
+            "date": now,
+            "body": "Test body",
+            "attachments": [],
+            "headers": None,
+        }
+
+        mock_get_body = AsyncMock(return_value=email_data)
+
+        with patch.object(classic_handler.incoming_client, "get_email_body_by_id", mock_get_body):
+            result = await classic_handler.get_emails_content(
+                email_ids=["123"],
+            )
+
+            assert result.emails[0].headers is None
+            mock_get_body.assert_called_once_with(
+                "123", "INBOX", False, allowed_senders=[], body_offset=0, max_body_length=20000, include_headers=None
             )
 
     @pytest.mark.asyncio
@@ -592,7 +704,7 @@ class TestClassicEmailHandler:
 
             assert len(result.emails) == 1
             mock_get_body.assert_called_once_with(
-                "123", "INBOX", False, allowed_senders=[], body_offset=0, max_body_length=20000
+                "123", "INBOX", False, allowed_senders=[], body_offset=0, max_body_length=20000, include_headers=None
             )
 
     @pytest.mark.asyncio
@@ -616,7 +728,7 @@ class TestClassicEmailHandler:
             await classic_handler.get_emails_content(email_ids=["456"])
 
             mock_get_body.assert_called_once_with(
-                "456", "INBOX", False, allowed_senders=[], body_offset=0, max_body_length=20000
+                "456", "INBOX", False, allowed_senders=[], body_offset=0, max_body_length=20000, include_headers=None
             )
 
     @pytest.mark.asyncio

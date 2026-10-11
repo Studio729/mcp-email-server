@@ -530,7 +530,29 @@ async def get_emails_content(
             "the requested body window.",
         ),
     ] = 20000,
+    include_headers: Annotated[
+        str | list[str] | None,
+        Field(
+            default=None,
+            description=(
+                "Optional header extraction mode for phishing/unsubscribe checks. "
+                "'phishing' returns Authentication-Results, ARC-Authentication-Results, Received-SPF, "
+                "DKIM-Signature, Return-Path, Reply-To, Received, List-Unsubscribe, and List-Unsubscribe-Post. "
+                "'all' returns all headers. A list of header names returns those specific headers. "
+                "Headers are fetched with BODY.PEEK to avoid marking messages as read. "
+                "Default is None (no extra headers, backward compatible)."
+            ),
+        ),
+    ] = None,
 ) -> EmailContentBatchResponse:
+    normalized_headers: str | tuple[str, ...] | None = None
+    if include_headers is not None:
+        if isinstance(include_headers, str):
+            normalized_headers = include_headers
+        elif isinstance(include_headers, list):
+            normalized_headers = tuple(include_headers)
+        else:
+            raise ValueError("include_headers must be 'all', 'phishing', or a list of header names")
     return await get_email_content_query(
         GetEmailContentQuery(
             account_name=account_name,
@@ -539,6 +561,7 @@ async def get_emails_content(
             mark_as_read=mark_as_read,
             body_offset=body_offset,
             max_body_length=max_body_length,
+            include_headers=normalized_headers,
         )
     )
 

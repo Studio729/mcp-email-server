@@ -23,12 +23,28 @@ from mcp_email_server.application.mutations import FlagOperation, MutableEmailFl
 from mcp_email_server.emails.classic import EmailClient, _classify_smtp_data_transport, _smtp_error_category
 
 
-def _imap(*, capabilities: tuple[str, ...] = ("IMAP4rev1", "UIDPLUS")) -> AsyncMock:
+def _imap(
+    *,
+    capabilities: tuple[str, ...] = ("IMAP4rev1", "UIDPLUS"),
+    existing_uids: list[str] | None = None,
+) -> AsyncMock:
     imap = AsyncMock()
     imap.login.return_value = MagicMock(result="OK", lines=[])
     imap.id.return_value = MagicMock(result="OK")
     imap.select.return_value = ("OK", [])
-    imap.uid.return_value = ("OK", [])
+    if existing_uids is not None:
+
+        async def uid_handler(command: str, *args: str):
+            if command == "fetch":
+                uids_requested = args[0].split(",") if args else []
+                existing = [uid for uid in uids_requested if uid in existing_uids]
+                data = [f"{uid} (UID {uid} FLAGS ())".encode() for uid in existing]
+                return ("OK", data)
+            return ("OK", [])
+
+        imap.uid = AsyncMock(side_effect=uid_handler)
+    else:
+        imap.uid.return_value = ("OK", [])
     imap.append.return_value = ("OK", [])
     imap.list.return_value = ("OK", [])
     imap.logout.return_value = ("BYE", [])
@@ -239,6 +255,8 @@ async def test_move_fallback_store_rejection_preserves_partial_fact_as_unknown(e
     imap = _imap()
 
     async def uid(command: str, *_args: str):
+        if command == "fetch":
+            return ("OK", [b"8 (UID 8 FLAGS ())"])
         return ("NO", []) if command == "store" else ("OK", [])
 
     imap.uid.side_effect = uid
@@ -247,27 +265,27 @@ async def test_move_fallback_store_rejection_preserves_partial_fact_as_unknown(e
 
     assert result.outcomes[0].status == "unknown"
     assert result.outcomes[0].detail == "copy-succeeded-store-failed"
-    assert [call.args[0] for call in imap.uid.await_args_list] == ["copy", "store"]
+    assert [call.args[0] for call in imap.uid.await_args_list] == ["fetch", "copy", "store"]
 
 
 @pytest.mark.asyncio
 async def test_native_move_transport_loss_is_unknown(email_server) -> None:
     client = EmailClient(email_server)
     imap = _imap(capabilities=("IMAP4rev1", "UIDPLUS", "MOVE"))
-    imap.uid.side_effect = ConnectionError("result lost")
+    imap.uid.side_effect = [("OK", [b"8 (UID 8 FLAGS ())"]), ConnectionError("result lost")]
     with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
         result = await client.move_emails_with_outcome(["8"], "INBOX", "Archive", allowed_senders=[])
 
     assert result.outcomes[0].status == "unknown"
     assert result.outcomes[0].detail == "move-unknown"
-    assert imap.uid.await_count == 1
+    assert imap.uid.await_count == 2
 
 
 @pytest.mark.asyncio
 async def test_native_move_disconnect_response_is_unknown(email_server) -> None:
     client = EmailClient(email_server)
     imap = _imap(capabilities=("IMAP4rev1", "UIDPLUS", "MOVE"))
-    imap.uid.return_value = ("BYE", [])
+    imap.uid.side_effect = [("OK", [b"8 (UID 8 FLAGS ())"]), ("BYE", [])]
     with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
         result = await client.move_emails_with_outcome(["8"], "INBOX", "Archive", allowed_senders=[])
 
@@ -278,19 +296,19 @@ async def test_native_move_disconnect_response_is_unknown(email_server) -> None:
 async def test_move_fallback_copy_disconnect_response_is_unknown_and_stops_uid(email_server) -> None:
     client = EmailClient(email_server)
     imap = _imap()
-    imap.uid.return_value = ("BYE", [])
+    imap.uid.side_effect = [("OK", [b"8 (UID 8 FLAGS ())"]), ("BYE", [])]
     with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
         result = await client.move_emails_with_outcome(["8"], "INBOX", "Archive", allowed_senders=[])
 
     assert (result.outcomes[0].status, result.outcomes[0].detail) == ("unknown", "copy-unknown")
-    assert [call.args[0] for call in imap.uid.await_args_list] == ["copy"]
+    assert [call.args[0] for call in imap.uid.await_args_list] == ["fetch", "copy"]
 
 
 @pytest.mark.asyncio
 async def test_move_fallback_store_disconnect_preserves_copy_as_unknown(email_server) -> None:
     client = EmailClient(email_server)
     imap = _imap()
-    imap.uid.side_effect = [("OK", []), ("BYE", [])]
+    imap.uid.side_effect = [("OK", [b"8 (UID 8 FLAGS ())"]), ("OK", []), ("BYE", [])]
     with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
         result = await client.move_emails_with_outcome(["8"], "INBOX", "Archive", allowed_senders=[])
 
@@ -298,7 +316,7 @@ async def test_move_fallback_store_disconnect_preserves_copy_as_unknown(email_se
         "unknown",
         "copy-succeeded-store-unknown",
     )
-    assert [call.args[0] for call in imap.uid.await_args_list] == ["copy", "store"]
+    assert [call.args[0] for call in imap.uid.await_args_list] == ["fetch", "copy", "store"]
 
 
 @pytest.mark.asyncio
@@ -833,7 +851,7 @@ async def test_mark_read_cancellation_preserves_partial_batch_and_stops(email_se
 async def test_native_move_cancellation_is_unknown_and_stops_batch(email_server) -> None:
     client = EmailClient(email_server)
     imap = _imap(capabilities=("IMAP4rev1", "UIDPLUS", "MOVE"))
-    imap.uid.side_effect = asyncio.CancelledError()
+    imap.uid.side_effect = [("OK", [b"8 (UID 8 FLAGS ())", b"9 (UID 9 FLAGS ())"]), asyncio.CancelledError()]
     with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
         result = await client.move_emails_with_outcome(["8", "9"], "INBOX", "Archive", allowed_senders=[])
 
@@ -841,14 +859,18 @@ async def test_native_move_cancellation_is_unknown_and_stops_batch(email_server)
         ("unknown", "move-unknown"),
         ("failed", "not-attempted"),
     ]
-    assert imap.uid.await_count == 1
+    assert imap.uid.await_count == 2
 
 
 @pytest.mark.asyncio
 async def test_move_fallback_store_cancellation_preserves_copy_and_stops(email_server) -> None:
     client = EmailClient(email_server)
     imap = _imap()
-    imap.uid.side_effect = [("OK", []), asyncio.CancelledError()]
+    imap.uid.side_effect = [
+        ("OK", [b"8 (UID 8 FLAGS ())", b"9 (UID 9 FLAGS ())"]),
+        ("OK", []),
+        asyncio.CancelledError(),
+    ]
     with patch.object(client, "_connect_imap", AsyncMock(return_value=imap)):
         result = await client.move_emails_with_outcome(["8", "9"], "INBOX", "Archive", allowed_senders=[])
 
@@ -856,7 +878,7 @@ async def test_move_fallback_store_cancellation_preserves_copy_and_stops(email_s
         ("unknown", "copy-succeeded-store-unknown"),
         ("failed", "not-attempted"),
     ]
-    assert [call.args[0] for call in imap.uid.await_args_list] == ["copy", "store"]
+    assert [call.args[0] for call in imap.uid.await_args_list] == ["fetch", "copy", "store"]
 
 
 @pytest.mark.asyncio

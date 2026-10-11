@@ -53,12 +53,29 @@ class EmailMetadataPageResponse(BaseModel):
     )
 
 
+PHISHING_UNSUBSCRIBE_HEADERS: frozenset[str] = frozenset({
+    "Authentication-Results",
+    "ARC-Authentication-Results",
+    "Received-SPF",
+    "DKIM-Signature",
+    "Return-Path",
+    "Reply-To",
+    "Received",
+    "List-Unsubscribe",
+    "List-Unsubscribe-Post",
+})
+
+
 class EmailBodyResponse(EmailMetadata):
     """Single email body response with body content and reply-thread headers."""
 
     in_reply_to: str | None = None
     references: str | None = None
     body: str
+    headers: dict[str, list[str]] | None = Field(
+        default=None,
+        description="Raw email headers when include_headers is requested. Keys are header names, values are lists of header values (a header may appear multiple times).",
+    )
 
 
 class EmailContentBatchResponse(BaseModel):
