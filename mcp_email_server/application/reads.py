@@ -98,6 +98,7 @@ class GetEmailContentQuery:
     mark_as_read: bool = False
     body_offset: int = 0
     max_body_length: int = 20_000
+    include_headers: str | tuple[str, ...] | None = None
 
     def validate(self) -> None:
         _validate_account_name(self.account_name)
@@ -107,6 +108,18 @@ class GetEmailContentQuery:
             raise ValueError("body_offset must not be negative")
         if not 1 <= self.max_body_length <= 100_000:
             raise ValueError("max_body_length must be between 1 and 100000")
+        if self.include_headers is not None:
+            if isinstance(self.include_headers, str):
+                if self.include_headers not in ("all", "phishing"):
+                    raise ValueError("include_headers string must be 'all' or 'phishing'")
+            elif isinstance(self.include_headers, tuple):
+                if len(self.include_headers) > 50:
+                    raise ValueError("include_headers list may contain at most 50 header names")
+                for header in self.include_headers:
+                    if not isinstance(header, str) or not header:
+                        raise ValueError("include_headers items must be non-empty strings")
+            else:
+                raise ValueError("include_headers must be 'all', 'phishing', or a list of header names")
 
 
 @dataclass(frozen=True)
@@ -261,6 +274,14 @@ def _validate_content_result(response: EmailContentBatchResponse) -> bytes:
         + sum(len(value.encode("utf-8")) for value in email.attachments)
         + sum(len(value.encode("utf-8")) for value in email.provider_keywords)
         + sum(len(value.encode("utf-8")) for value in email.semantic_tags)
+        + (
+            sum(
+                len(name.encode("utf-8")) + sum(len(v.encode("utf-8")) for v in values)
+                for name, values in email.headers.items()
+            )
+            if email.headers
+            else 0
+        )
         for email in response.emails
     )
     if header_bytes > APPLICATION_LIMITS.aggregate_header_bytes:

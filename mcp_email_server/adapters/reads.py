@@ -72,6 +72,7 @@ class ClassicReadProvider:
                     allowed_senders=list(account.allowed_senders),
                     body_offset=query.body_offset,
                     max_body_length=query.max_body_length,
+                    include_headers=query.include_headers,
                 )
                 if not email_data:
                     failed_ids.append(email_id)
@@ -92,6 +93,7 @@ class ClassicReadProvider:
                         for flag in email_data.get("_flags", [])
                         if isinstance(flag, str) and not flag.startswith("\\")
                     ],
+                    headers=email_data.get("headers"),
                 )
             except asyncio.CancelledError:
                 raise
@@ -122,6 +124,14 @@ class ClassicReadProvider:
                 + len(email.sender.encode("utf-8"))
                 + sum(len(value.encode("utf-8")) for value in email.recipients)
                 + sum(len(value.encode("utf-8")) for value in email.attachments)
+                + (
+                    sum(
+                        len(name.encode("utf-8")) + sum(len(v.encode("utf-8")) for v in values)
+                        for name, values in email.headers.items()
+                    )
+                    if email.headers
+                    else 0
+                )
             )
             if aggregate_header_bytes > APPLICATION_LIMITS.aggregate_header_bytes:
                 raise ReadProviderError(

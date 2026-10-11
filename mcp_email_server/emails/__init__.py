@@ -61,6 +61,7 @@ class EmailHandler(abc.ABC):
         mark_as_read: bool = False,
         body_offset: int = 0,
         max_body_length: int = 20000,
+        include_headers: str | tuple[str, ...] | None = None,
     ) -> "EmailContentBatchResponse":
         """
         Get full content (including body) of multiple emails by their email IDs (IMAP UIDs).
@@ -69,6 +70,12 @@ class EmailHandler(abc.ABC):
             body_offset: Character offset into each body to start reading from (for paging).
             max_body_length: Maximum number of body characters to return, counted from
                 body_offset. If more remains, the body ends with the '...[TRUNCATED]' marker.
+            include_headers: Optional header extraction mode:
+                - None: no headers returned (default, backward compatible)
+                - "all": all headers returned
+                - "phishing": phishing/unsubscribe headers for security checks
+                - tuple of header names: specific headers returned
+                Headers are fetched with BODY.PEEK to avoid marking messages as read.
         """
 
     @abc.abstractmethod

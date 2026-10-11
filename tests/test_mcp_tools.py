@@ -665,6 +665,69 @@ class TestMcpTools:
         assert query.max_body_length == 2000
 
     @pytest.mark.asyncio
+    async def test_get_emails_content_include_headers_phishing(self):
+        """Test get_emails_content with include_headers='phishing'."""
+        response = EmailContentBatchResponse(emails=[], requested_count=1, retrieved_count=0, failed_ids=["123"])
+        query_handler = AsyncMock(return_value=response)
+
+        with patch("mcp_email_server.app.get_email_content_query", query_handler):
+            await get_emails_content(
+                account_name="test",
+                email_ids=["123"],
+                include_headers="phishing",
+            )
+
+        query = query_handler.await_args.args[0]
+        assert query.include_headers == "phishing"
+
+    @pytest.mark.asyncio
+    async def test_get_emails_content_include_headers_all(self):
+        """Test get_emails_content with include_headers='all'."""
+        response = EmailContentBatchResponse(emails=[], requested_count=1, retrieved_count=0, failed_ids=["123"])
+        query_handler = AsyncMock(return_value=response)
+
+        with patch("mcp_email_server.app.get_email_content_query", query_handler):
+            await get_emails_content(
+                account_name="test",
+                email_ids=["123"],
+                include_headers="all",
+            )
+
+        query = query_handler.await_args.args[0]
+        assert query.include_headers == "all"
+
+    @pytest.mark.asyncio
+    async def test_get_emails_content_include_headers_custom_list(self):
+        """Test get_emails_content with custom header list."""
+        response = EmailContentBatchResponse(emails=[], requested_count=1, retrieved_count=0, failed_ids=["123"])
+        query_handler = AsyncMock(return_value=response)
+
+        with patch("mcp_email_server.app.get_email_content_query", query_handler):
+            await get_emails_content(
+                account_name="test",
+                email_ids=["123"],
+                include_headers=["Authentication-Results", "DKIM-Signature"],
+            )
+
+        query = query_handler.await_args.args[0]
+        assert query.include_headers == ("Authentication-Results", "DKIM-Signature")
+
+    @pytest.mark.asyncio
+    async def test_get_emails_content_include_headers_default_none(self):
+        """Test get_emails_content default include_headers is None."""
+        response = EmailContentBatchResponse(emails=[], requested_count=1, retrieved_count=0, failed_ids=["123"])
+        query_handler = AsyncMock(return_value=response)
+
+        with patch("mcp_email_server.app.get_email_content_query", query_handler):
+            await get_emails_content(
+                account_name="test",
+                email_ids=["123"],
+            )
+
+        query = query_handler.await_args.args[0]
+        assert query.include_headers is None
+
+    @pytest.mark.asyncio
     async def test_move_emails(self):
         command_handler = AsyncMock(
             return_value=MoveMutationOutcome(_batch_outcome(succeeded=("12345", "12346")), "Archive")

@@ -17,6 +17,7 @@ def email_client(email_server):  # email_server comes from conftest.py
 def _make_mock_imap(**overrides):
     """AsyncMock IMAP client with sensible mutation defaults."""
     capabilities = overrides.pop("capabilities", ("IMAP4rev1", "UIDPLUS"))
+    existing_uids = overrides.pop("existing_uids", None)
     mock = AsyncMock()
     mock._client_task = asyncio.Future()
     mock._client_task.set_result(None)
@@ -24,7 +25,21 @@ def _make_mock_imap(**overrides):
     mock.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
     mock.id = AsyncMock(return_value=MagicMock(result="OK"))
     mock.select = AsyncMock(return_value=("OK", []))
-    mock.uid = AsyncMock(return_value=("OK", []))
+
+    if existing_uids is not None:
+
+        async def uid_handler(command: str, *args: str):
+            if command == "fetch":
+                uids_requested = args[0].split(",") if args else []
+                existing = [uid for uid in uids_requested if uid in existing_uids]
+                data = [f"{uid} (UID {uid} FLAGS ())".encode() for uid in existing]
+                return ("OK", data)
+            return ("OK", [])
+
+        mock.uid = AsyncMock(side_effect=uid_handler)
+    else:
+        mock.uid = AsyncMock(return_value=("OK", []))
+
     mock.expunge = AsyncMock(return_value=("OK", []))
     mock.logout = AsyncMock()
     mock.protocol = MagicMock(capabilities=capabilities)
@@ -69,7 +84,12 @@ class _MailboxStateProtocolFake:
 
     async def uid(self, command: str, *args: str):
         self.uid_calls.append((command, args))
-        if command == "copy":
+        if command == "fetch":
+            uids_requested = args[0].split(",")
+            existing = [uid for uid in uids_requested if uid in self.source_uids]
+            data = [f"{uid} (UID {uid} FLAGS ())".encode() for uid in existing]
+            return "OK", data
+        elif command == "copy":
             self.destination_uids.add(args[0])
         elif command == "store":
             self.deleted_uids.add(args[0])
@@ -312,7 +332,11 @@ class TestMarkAsReadAllowlist:
 class TestMoveEmailsAllowlist:
     @pytest.mark.asyncio
     async def test_blocked_uid_not_moved_default_silent(self, email_client):
-        mock_imap = _make_mock_imap(move=AsyncMock(return_value=("OK", [])), capabilities=("IMAP4rev1", "MOVE"))
+        mock_imap = _make_mock_imap(
+            move=AsyncMock(return_value=("OK", [])),
+            capabilities=("IMAP4rev1", "MOVE"),
+            existing_uids=["1", "2"],
+        )
         senders = {"1": "ok@allowed.com", "2": "evil@blocked.com"}
         with (
             patch.object(email_client, "_batch_fetch_senders", AsyncMock(return_value=senders)),
@@ -327,7 +351,11 @@ class TestMoveEmailsAllowlist:
 
     @pytest.mark.asyncio
     async def test_blocked_uid_reported_when_configured(self, email_client):
-        mock_imap = _make_mock_imap(move=AsyncMock(return_value=("OK", [])), capabilities=("IMAP4rev1", "MOVE"))
+        mock_imap = _make_mock_imap(
+            move=AsyncMock(return_value=("OK", [])),
+            capabilities=("IMAP4rev1", "MOVE"),
+            existing_uids=["1", "2"],
+        )
         senders = {"1": "ok@allowed.com", "2": "evil@blocked.com"}
         with (
             patch.object(email_client, "_batch_fetch_senders", AsyncMock(return_value=senders)),
@@ -342,8 +370,10 @@ class TestMoveEmailsAllowlist:
 
     @pytest.mark.asyncio
     async def test_blocked_uid_not_copied_on_fallback_default_silent(self, email_client):
-        # No MOVE capability -> COPY + STORE \Deleted fallback path
-        mock_imap = _make_mock_imap(capabilities=("IMAP4rev1", "UIDPLUS"))
+        mock_imap = _make_mock_imap(
+            capabilities=("IMAP4rev1", "UIDPLUS"),
+            existing_uids=["1", "2"],
+        )
         senders = {"1": "ok@allowed.com", "2": "evil@blocked.com"}
         with (
             patch.object(email_client, "_batch_fetch_senders", AsyncMock(return_value=senders)),
@@ -359,7 +389,10 @@ class TestMoveEmailsAllowlist:
 
     @pytest.mark.asyncio
     async def test_all_blocked_fallback_no_copy_no_store_no_expunge(self, email_client):
-        mock_imap = _make_mock_imap(capabilities=("IMAP4rev1",))  # no MOVE -> COPY+STORE fallback
+        mock_imap = _make_mock_imap(
+            capabilities=("IMAP4rev1",),
+            existing_uids=["1", "2"],
+        )
         senders = {"1": "evil@blocked.com", "2": "spam@blocked.com"}
         with (
             patch.object(email_client, "_batch_fetch_senders", AsyncMock(return_value=senders)),
@@ -376,7 +409,10 @@ class TestMoveEmailsAllowlist:
 
     @pytest.mark.asyncio
     async def test_mixed_fallback_expunge_only_from_allowed_work(self, email_client):
-        mock_imap = _make_mock_imap(capabilities=("IMAP4rev1", "UIDPLUS"))  # safe fallback path
+        mock_imap = _make_mock_imap(
+            capabilities=("IMAP4rev1", "UIDPLUS"),
+            existing_uids=["1", "2"],
+        )
         senders = {"1": "ok@allowed.com", "2": "evil@blocked.com"}
         with (
             patch.object(email_client, "_batch_fetch_senders", AsyncMock(return_value=senders)),

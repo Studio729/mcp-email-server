@@ -735,6 +735,66 @@ def _has_already_exists_code(response: Any) -> bool:
     return False
 
 
+def _parse_copyuid_response(response: Any) -> tuple[str, set[str]] | None:
+    """Parse COPYUID response code from UID COPY/MOVE result.
+
+    RFC 4315 (UIDPLUS) defines COPYUID as:
+        COPYUID <uidvalidity> <source-uid-set> <destination-uid-set>
+
+    Returns (uidvalidity, set of source UIDs that were copied) or None if not found.
+    The source-uid-set tells us which UIDs actually existed and were copied.
+    """
+    lines = response[1] if isinstance(response, tuple | list) and len(response) > 1 else getattr(response, "lines", ())
+    for line in lines or ():
+        text = line.decode("utf-8", "replace") if isinstance(line, bytes | bytearray) else str(line)
+        match = re.search(r"\[COPYUID\s+(\d+)\s+([\d:,]+)\s+([\d:,]+)\]", text, re.IGNORECASE)
+        if match:
+            uidvalidity = match.group(1)
+            source_uid_set = match.group(2)
+            copied_uids: set[str] = set()
+            for part in source_uid_set.split(","):
+                if ":" in part:
+                    start_str, end_str = part.split(":", 1)
+                    start, end = int(start_str), int(end_str)
+                    copied_uids.update(str(uid) for uid in range(start, end + 1))
+                else:
+                    copied_uids.add(part)
+            return (uidvalidity, copied_uids)
+    return None
+
+
+async def _check_uids_exist(
+    imap: Any,
+    email_ids: list[str],
+) -> set[str]:
+    """Check which UIDs exist in the currently selected mailbox.
+
+    Returns the set of UIDs that exist. UIDs not in the returned set do not exist.
+    Uses UID FETCH FLAGS which is lightweight and doesn't mark messages as read.
+    """
+    if not email_ids:
+        return set()
+
+    existing_uids: set[str] = set()
+    uid_list = ",".join(email_ids)
+
+    try:
+        response = await imap.uid("fetch", uid_list, "(FLAGS)")
+        if _imap_status(response) != "OK":
+            return existing_uids
+
+        _, data = response
+        for item in data:
+            if isinstance(item, bytes):
+                uid_match = re.search(rb"UID\s+(\d+)", item)
+                if uid_match:
+                    existing_uids.add(uid_match.group(1).decode())
+    except Exception:
+        logger.debug("UID existence check failed, assuming UIDs do not exist")
+
+    return existing_uids
+
+
 async def _best_effort_imap_logout(imap: Any) -> None:
     """Close an IMAP session without replacing mutation evidence with cleanup failure."""
     try:
@@ -1389,11 +1449,18 @@ class EmailClient:
         body_offset: int = 0,
         max_body_length: int = MAX_BODY_LENGTH,
         parsed: Message | None = None,
+        include_headers: str | tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
         """Parse raw email data into a structured dictionary.
 
         ``parsed`` lets a caller that already holds the ``policy=default`` parse of
         ``raw_email`` share it instead of paying a second full parse.
+
+        ``include_headers`` controls raw header extraction:
+        - None: no headers returned
+        - "all": all headers returned
+        - "phishing": phishing/unsubscribe headers (Authentication-Results, DKIM-Signature, etc.)
+        - tuple of header names: only those specific headers returned
         """
         email_message = parsed if parsed is not None else BytesParser(policy=default).parsebytes(raw_email)
 
@@ -1445,6 +1512,28 @@ class EmailClient:
             if body_offset + max_body_length < len(body):
                 window += "...[TRUNCATED]"
             body = window
+
+        headers: dict[str, list[str]] | None = None
+        if include_headers is not None:
+            from mcp_email_server.emails.models import PHISHING_UNSUBSCRIBE_HEADERS
+
+            headers = {}
+            if include_headers == "all":
+                for key in email_message:
+                    values = email_message.get_all(key)
+                    if values:
+                        headers[key] = [str(v) for v in values]
+            elif include_headers == "phishing":
+                for header_name in PHISHING_UNSUBSCRIBE_HEADERS:
+                    values = email_message.get_all(header_name)
+                    if values:
+                        headers[header_name] = [str(v) for v in values]
+            elif isinstance(include_headers, tuple):
+                for header_name in include_headers:
+                    values = email_message.get_all(header_name)
+                    if values:
+                        headers[header_name] = [str(v) for v in values]
+
         return {
             "email_id": email_id or "",
             "message_id": message_id,
@@ -1456,6 +1545,7 @@ class EmailClient:
             "body": body,
             "date": date,
             "attachments": attachments,
+            "headers": headers,
         }
 
     @staticmethod
@@ -2188,6 +2278,7 @@ class EmailClient:
         allowed_senders: list[str] | None = None,
         body_offset: int = 0,
         max_body_length: int = MAX_BODY_LENGTH,
+        include_headers: str | tuple[str, ...] | None = None,
     ) -> dict[str, Any] | None:
         del mark_as_read  # Compatibility argument; the application owns the mutation.
         validate_imap_uid(email_id)
@@ -2225,7 +2316,11 @@ class EmailClient:
             # Parse the email
             try:
                 email_data = self._parse_email_data(
-                    raw_email, email_id, body_offset=body_offset, max_body_length=max_body_length
+                    raw_email,
+                    email_id,
+                    body_offset=body_offset,
+                    max_body_length=max_body_length,
+                    include_headers=include_headers,
                 )
                 email_data["_flags"] = self._extract_message_flags(data)
             except Exception as e:
@@ -3467,7 +3562,12 @@ class EmailClient:
         allowed_senders: list[str] | None = None,
         report_blocked_mutations: bool = False,
     ) -> BatchMutationOutcome:
-        """Move UIDs with native MOVE or scoped COPY/STORE/UID EXPUNGE evidence."""
+        """Move UIDs with native MOVE or scoped COPY/STORE/UID EXPUNGE evidence.
+
+        Verifies UID existence before attempting the move. UIDs that don't exist in the
+        source mailbox are reported as failed with "uid-not-found" detail. Where available,
+        COPYUID response codes are used to verify which UIDs were actually moved.
+        """
         _validate_imap_uids(email_ids)
         imap = await self._connect_imap()
         outcomes: dict[str, TargetMutationOutcome] = {}
@@ -3478,10 +3578,16 @@ class EmailClient:
             select_response = await imap.select(_quote_mailbox(source_mailbox))
             _raise_for_imap_error(select_response, f"SELECT source mailbox {source_mailbox}")
             has_move = "MOVE" in capabilities
+            has_uidplus = _supports_uid_expunge(imap)
+
+            existing_uids = await _check_uids_exist(imap, email_ids)
             blocked = await self._blocked_uids(imap, email_ids, allowed_senders)
+
             permitted: list[str] = []
             for email_id in email_ids:
-                if email_id in blocked:
+                if email_id not in existing_uids:
+                    outcomes[email_id] = TargetMutationOutcome(email_id, "failed", "uid-not-found")
+                elif email_id in blocked:
                     outcomes[email_id] = TargetMutationOutcome(
                         email_id,
                         "failed" if report_blocked_mutations else "succeeded",
@@ -3489,7 +3595,7 @@ class EmailClient:
                     )
                 else:
                     permitted.append(email_id)
-            if permitted and not has_move and not _supports_uid_expunge(imap):
+            if permitted and not has_move and not has_uidplus:
                 for email_id in permitted:
                     outcomes[email_id] = TargetMutationOutcome(email_id, "failed", "uidplus-unavailable")
             elif has_move:
@@ -3509,15 +3615,20 @@ class EmailClient:
                         outcomes[email_id] = TargetMutationOutcome(email_id, "unknown", "move-unknown")
                         continue
                     move_status = _imap_effect_status(response)
-                    outcomes[email_id] = TargetMutationOutcome(
-                        email_id,
-                        move_status,
-                        None
-                        if move_status == "succeeded"
-                        else "move-rejected"
-                        if move_status == "failed"
-                        else "move-unknown",
-                    )
+                    if move_status == "succeeded":
+                        copyuid = _parse_copyuid_response(response)
+                        if copyuid is not None and has_uidplus:
+                            _, moved_uids = copyuid
+                            if email_id not in moved_uids:
+                                outcomes[email_id] = TargetMutationOutcome(email_id, "failed", "uid-not-found")
+                                continue
+                        outcomes[email_id] = TargetMutationOutcome(email_id, "succeeded")
+                    else:
+                        outcomes[email_id] = TargetMutationOutcome(
+                            email_id,
+                            move_status,
+                            "move-rejected" if move_status == "failed" else "move-unknown",
+                        )
             else:
                 pending_expunge: list[str] = []
                 stopped = False
@@ -3545,6 +3656,12 @@ class EmailClient:
                             "copy-rejected" if copy_status == "failed" else "copy-unknown",
                         )
                         continue
+                    copyuid = _parse_copyuid_response(copy_response)
+                    if copyuid is not None and has_uidplus:
+                        _, copied_uids = copyuid
+                        if email_id not in copied_uids:
+                            outcomes[email_id] = TargetMutationOutcome(email_id, "failed", "uid-not-found")
+                            continue
                     try:
                         self._check_mutation_authority()
                         store_response = await imap.uid("store", email_id, "+FLAGS", r"(\Deleted)")
@@ -3726,6 +3843,8 @@ class EmailClient:
 
         A blocked sender's UID is never copied/moved: reported as a no-op success by default,
         or in failed_ids when report_blocked_mutations is True.
+
+        UIDs that don't exist in the source mailbox are reported in failed_ids.
         """
         imap = await self._connect_imap()
         moved_ids = []
@@ -3741,10 +3860,18 @@ class EmailClient:
             has_move = "MOVE" in capabilities
 
             unique_email_ids = list(dict.fromkeys(email_ids))
+
+            existing_uids = await _check_uids_exist(imap, unique_email_ids)
+            not_found_ids = [uid for uid in unique_email_ids if uid not in existing_uids]
+            failed_ids.extend(not_found_ids)
+
             blocked = await self._blocked_uids(imap, unique_email_ids, allowed_senders)
-            permitted_ids = [email_id for email_id in unique_email_ids if email_id not in blocked]
+            permitted_ids = [
+                email_id for email_id in unique_email_ids if email_id in existing_uids and email_id not in blocked
+            ]
             for email_id in blocked:
-                (failed_ids if report_blocked_mutations else moved_ids).append(email_id)
+                if email_id in existing_uids:
+                    (failed_ids if report_blocked_mutations else moved_ids).append(email_id)
 
             # Reject the COPY+DELETE fallback before COPY unless its exact source
             # UIDs can be expunged. This prevents both duplicate destinations and
@@ -3941,12 +4068,20 @@ class ClassicEmailHandler(EmailHandler):
         mark_as_read: bool = False,
         body_offset: int = 0,
         max_body_length: int = MAX_BODY_LENGTH,
+        include_headers: str | tuple[str, ...] | None = None,
     ) -> EmailContentBatchResponse:
         """Batch retrieve email body content, honoring the sender allowlist.
 
         The allowlist is enforced in the read path: get_email_body_by_id checks the From header
         before fetching the body, so a blocked message is never read or marked and returns None —
         indistinguishable from a missing/inaccessible one (both land in failed_ids).
+
+        Args:
+            include_headers: Optional header extraction mode:
+                - None: no headers returned
+                - "all": all headers returned
+                - "phishing": phishing/unsubscribe headers
+                - tuple of header names: specific headers returned
         """
         del mark_as_read  # The MCP/application adapter sequences this separate mutation.
         allowed_senders = get_settings().allowed_senders
@@ -3962,6 +4097,7 @@ class ClassicEmailHandler(EmailHandler):
                     allowed_senders=allowed_senders,
                     body_offset=body_offset,
                     max_body_length=max_body_length,
+                    include_headers=include_headers,
                 )
                 if not email_data:
                     failed_ids.append(email_id)
@@ -3978,6 +4114,7 @@ class ClassicEmailHandler(EmailHandler):
                         date=email_data["date"],
                         body=email_data["body"],
                         attachments=email_data["attachments"],
+                        headers=email_data.get("headers"),
                     )
                 )
             except Exception as e:

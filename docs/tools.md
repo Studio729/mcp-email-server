@@ -220,6 +220,7 @@ a configured tag. An omitted `writable` value is reported as `false`.
 | `mark_as_read`    | `false`  | Mark successfully retrieved messages as read.                   |
 | `body_offset`     | `0`      | Character offset at which body output starts.                   |
 | `max_body_length` | `20000`  | Maximum body characters returned per message, from 1 to 100000. |
+| `include_headers` | None     | Optional header extraction mode for phishing and unsubscribe checks. |
 
 If a body extends beyond the requested window, the returned body ends with
 `...[TRUNCATED]`. Fetch the next chunk by increasing `body_offset` by
@@ -239,6 +240,22 @@ but malformed values containing other control characters can be returned and
 will be rejected by compose validation. These fields are available only from
 full-content reads: they are not part of `list_emails_metadata` and are not
 persisted in the SQLite metadata projection.
+
+The optional `include_headers` parameter allows retrieval of raw email headers
+for phishing detection and unsubscribe workflows without marking messages as
+read. It accepts three forms:
+
+- `"phishing"`: Returns a predefined set of headers useful for phishing and
+  spam analysis: `Authentication-Results`, `ARC-Authentication-Results`,
+  `Received-SPF`, `DKIM-Signature`, `Return-Path`, `Reply-To`, `Received`,
+  `List-Unsubscribe`, and `List-Unsubscribe-Post`.
+- `"all"`: Returns all headers from the message.
+- An array of up to 50 header names: Returns only the specified headers.
+
+When present, headers are returned in the response as a dictionary mapping
+header names to lists of string values, preserving multi-valued headers like
+`Received`. Header names are case-insensitive during extraction. Headers are
+fetched using `BODY.PEEK` to avoid setting the `\Seen` flag.
 
 MIME body extraction does not descend into attachment subtrees. In particular,
 the body of an attached or forwarded `message/rfc822` message is never merged
